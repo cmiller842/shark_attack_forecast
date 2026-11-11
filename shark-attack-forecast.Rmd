@@ -1,0 +1,276 @@
+---
+title: "Shark Attack Forecast"
+author: "Charles Miller"
+date: "2025-04-22"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+## Data Preparation
+
+```{r}
+library(dplyr)
+
+# Importing original incident records
+attack_data <- read.csv("global_shark_attacks.csv", header=TRUE)
+
+# Count recorded unprovoked attacks in each year.
+annual_counts <- attack_data %>%
+  filter(type == "Unprovoked", year >= 1916) %>%
+  count(year, name = "n") %>%
+  arrange(year)
+
+# Use the same historical period for all model fitting.
+parse_data <- annual_counts %>%
+  filter(year <= 2021)
+
+# Check that every training year appears exactly once.
+stopifnot(identical(as.integer(parse_data$year), 1916:2021))
+
+# Keep 2022 separate for checking the forecast later.
+observed_2022 <- annual_counts %>%
+  filter(year == 2022)
+
+# Create an annual time series.
+attack_ts <- ts(
+  parse_data$n,
+  start = 1916,
+  frequency = 1
+)
+
+plot(
+  attack_ts,
+  main = "Recorded Unprovoked Shark Attacks, 1916–2021",
+  xlab = "Year",
+  ylab = "Number of Recorded Attacks"
+)
+```
+
+Recorded unprovoked shark attacks generally increased over time, although the increase was uneven.  The series shows noticeable peaks and declines, including a peak around 1960, with larger year-to-year fluctuations appearing in later decades.
+
+## Linear Regression Baseline
+
+```{r linear-model}
+# Fit a straight-line relationship between year and recorded attacks.
+lin_model <- lm(n ~ year, data = parse_data)
+
+plot(
+  attack_ts,
+  main = "Linear Trend in Recorded Unprovoked Shark Attacks",
+  xlab = "Year",
+  ylab = "Number of Recorded Attacks"
+)
+abline(lin_model, col = "blue", lwd = 2)
+
+summary(lin_model)
+```
+
+The $R^2$ value of 0.7343 suggests 73.43% of the variation in annual recorded attacks is explained by the model.  With a slope of .7817, the fitted trend rises by about .78 recorded attacks per year, or roughly eight per decade.  I next examined the residuals to check for patterns the linear trend didn't capture.
+
+## Linear Model Diagnostics
+
+```{r linear-residuals}
+plot(lin_model, which=1)
+```
+
+A clear curved pattern exists in the residuals plot.  Residuals tend to be positive at low and high fitted values and negative in the middle suggesting the model generally underpredicts at the ends and overpredicts in the middle.  The plot suggests the linear model doesn't fully capture how recorded attacks changed over time, supporting investigation of another model.
+
+## Autocorrelation in Annual Counts
+
+```{r original-acf-pacf}
+acf(
+  attack_ts,
+  main = "ACF of Annual Recorded Attacks"
+)
+
+pacf(
+  attack_ts,
+  main = "PACF of Annual Recorded Attacks"
+)
+```
+
+Analyzing the ACF plot of the data, we see that it slowly decays toward zero, with positive correlation remaining across many lags.  This suggests annual counts are strongly related across time.  The PACF plot has a dominant spike at lag 1, a smaller spike at lag 2 and little afterward.  The PACF suggests an AR(1) model is worth exploring initially, but the ACF suggests checking whether the series is stationary.
+
+## Initial AR(1) Model
+
+```{r initial-ar1}
+library(lmtest)
+
+# Fit an AR(1) model to the annual counts.
+attack_ar1 <- arima(attack_ts, order = c(1, 0, 0))
+
+attack_ar1
+
+# Test whether the AR coefficient differs from zero.
+coeftest(attack_ar1)
+
+# Check for remaining autocorrelation through lag 10.
+Box.test(
+  residuals(attack_ar1),
+  lag = 10,
+  type = "Ljung-Box",
+  fitdf = 1
+)
+```
+
+Hypothesis Test for Significance of phi_1
+
+$H_0: \phi_1 = 0$
+
+$H_a: \phi_1 \ne 0$
+
+We observe a p-value < 0.05.  Therefore, we can reject the null and conclude there is sufficient evidence to suggest that $\phi_1 \ne 0$.  The coefficient estimate of .9638 indicates a strong positive dependence on the previous year within the fitted model.
+
+Hypothesis Test for Autocorrelation in Residuals
+
+$H_0:$ All residual autocorrelations at lags 1-10 are zero
+
+$H_a:$ At least one autocorrelation from lags 1-10 is not equal to zero
+
+We observe a p-value = 0.005847 < 0.05.  Therefore, we can reject the null and conclude there is sufficient evidence to suggest that autocorrelation exists in the residuals through lag 10.  This suggests there is information not being captured by this model and temporal patterns remain unexplained.  Next, I examined whether the series was stationary.
+
+## Checking Stationarity
+
+```{r original-adf}
+library(tseries)
+
+# Test the original annual series for a unit root.
+adf.test(attack_ts, k = 1)
+```
+
+$H_0:$ The series has a unit root
+
+$H_a:$ The series is stationary around a deterministic linear trend.
+
+This version of the test includes a constant and a trend.
+
+According to the ADF test p-value 0.5978 > 0.05, we fail to reject the null and conclude there is not sufficient evidence to suggest the data is stationary around a linear trend.  Together with the upward trend and slowly decaying ACF, this supports examining first differences, or the change in recorded attacks from one year to the next.
+
+## First Differencing
+
+```{r first-differences}
+# Calculate the change in recorded attacks between consecutive years.
+attack_tsd <- diff(attack_ts, differences = 1)
+
+plot(
+  attack_tsd,
+  main = "Year-to-Year Change in Recorded Attacks",
+  xlab = "Year",
+  ylab = "Change in Recorded Attacks"
+)
+abline(h = 0, col = "gray", lty = 2)
+
+# Check the differenced series for a unit root.
+adf.test(attack_tsd, k = 1)
+```
+
+The upward trend mostly disappeared, and the changes fluctuate around zero.  Later years show somewhat larger swings, so variability may still change over time.  The ADF test gives p < 0.01, so we can reject the unit-root null for the differenced series.  Together, the plot and test support using first differencing.
+
+## Automated ARIMA Model Selection
+
+```{r automatic-arima}
+library(forecast)
+
+# Search for a candidate model using the original annual series.
+suggested_model <- auto.arima(attack_ts)
+
+suggested_model
+```
+
+The function selected ARIMA(1,1,0), supporting an investigation using first differencing.  A coefficient of -0.4276 suggests that an increase tends to be followed by a decrease, and vice versa, within the fitted model.  I next examined the ACF and PACF of the differenced series to see whether their patterns supported this model.
+
+## Autocorrelation After Differencing
+
+```{r differenced-acf-pacf}
+acf(
+  attack_tsd,
+  main = "ACF of Annual Changes"
+)
+
+pacf(
+  attack_tsd,
+  main = "PACF of Annual Changes"
+)
+```
+
+Both plots show a strong negative spike at lag 1, with remaining lags inside the dashed bounds.  The dominant lag-1 PACF supports an AR(1) model for the annual changes.
+
+## ARIMA(1,1,0) Model and Diagnostics
+
+```{r differenced-model}
+# Fit an AR(1) model to first differences of the original series.
+attack_ar1b <- arima(attack_ts, order = c(1, 1, 0))
+
+attack_ar1b
+
+# Test whether the AR coefficient differs from zero.
+coeftest(attack_ar1b)
+
+# Check for remaining residual autocorrelation through lag 10.
+Box.test(
+  residuals(attack_ar1b),
+  lag = 10,
+  type = "Ljung-Box",
+  fitdf = 1
+)
+```
+
+Hypothesis Test for Significance of phi_1
+
+$H_0: \phi_1 = 0$
+
+$H_a: \phi_1 \ne 0$
+
+Given the observed p-value < 0.05 we can reject the null and conclude there is sufficient evidence to suggest $\phi_1 \ne 0$.  The AR coefficient of -0.4276 suggests a negative relationship between consecutive annual changes within the fitted model.
+
+Hypothesis Test for Autocorrelation in Residuals
+
+$H_0:$ All residual autocorrelations at lags 1-10 are zero
+
+$H_a:$ At least one autocorrelation from lags 1-10 is not equal to zero
+
+Given the p-value = 0.9578 > 0.05 we fail to reject the null.  There is insufficient evidence of residual autocorrelation through lag 10, supporting the model's adequacy in capturing temporal dependence.
+
+## Residual Normality
+
+```{r residual-qq}
+qqnorm(
+  residuals(attack_ar1b),
+  main = "Normal Q–Q Plot of ARIMA Residuals"
+)
+
+qqline(residuals(attack_ar1b), col = "blue", lwd = 2)
+```
+
+Overall, the points follow the line closely through the middle, with departures in the tails, especially the upper tail.  This suggests the residuals are approximately normal in the center, but deviations in the tails warrant caution when interpreting prediction intervals.
+
+## Model Selection
+
+The initial AR(1) model left significant residual autocorrelations leading to stationarity checks.   Those checks supported first differencing and auto.arima() selected an ARIMA(1,1,0) model.  The new model showed no significant residual autocorrelation through lag 10, although its Q-Q plot showed some tail departures.  Based on these results, I used ARIMA(1,1,0) to forecast annual recorded attacks for the next ten years.
+
+## Ten-Year Forecast
+
+```{r ten-year-forecast}
+# Forecast recorded annual attacks for 2022–2031.
+attack_forecast <- forecast(attack_ar1b, h = 10)
+
+plot(
+  attack_forecast,
+  main = "Forecast of Recorded Unprovoked Attacks",
+  xlab = "Year",
+  ylab = "Number of Recorded Attacks"
+)
+
+attack_forecast
+observed_2022
+```
+
+The model forecasts about 89 recorded unprovoked shark attacks worldwide for 2022, compared with the recorded count of 81, an overestimate of about eight attacks.  The recorded count falls within both the 80% and 95% prediction intervals, although this single comparison provides limited evidence about forecast accuracy over the full ten-year period.  Forecasts for subsequent years settle near 90 attacks annually, while widening prediction intervals reflect increasing uncertainty farther into the future.  This leveling off is a feature of the fitted model, and actual annual counts could vary substantially around these predictions.
+
+\newpage
+## Limitations and Future Work
+
+The analysis raises questions about factors that might help explain changes in recorded attacks.  Future work could examine individual countries or incorporate measures of beach attendance and ocean recreation to investigate whether they improve the forecasts.  Comparing forecasts across several withheld years could give a fuller assessment of accuracy.  Changes in reporting and documentation over time could also affect the number of recorded attacks.  This analysis doesn't measure individual risk because the dataset does not indicate how many people entered the water or how much time they spend there.
